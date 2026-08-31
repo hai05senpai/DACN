@@ -1,0 +1,13 @@
+# Python environment & cache
+.venv/
+__pycache__/
+*.pyc
+
+# Environment variables (API Keys)
+.env
+
+# Tool outputs & temp files
+crytic-export/
+slither.db.json
+.foundry/
+out/

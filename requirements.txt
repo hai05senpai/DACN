@@ -1,0 +1,8 @@
+mcp
+langchain-core
+langchain-community
+langchain-openai
+python-dotenv
+rich
+typer
+slither-analyzer
