@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import re
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from rich.console import Console
@@ -44,6 +45,36 @@ def auto_record_findings(text: str, memory: IncrementalFindingsMemory):
                 evidence="contracts/SimpleBank.sol: withdraw()"
             )
 
+def save_markdown_report(contract_path: str, report_content: str) -> Path:
+    """Tự động tạo thư mục reports/ và lưu báo cáo dưới dạng file .md kèm timestamp."""
+    reports_dir = Path("reports")
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    contract_name = Path(contract_path).stem
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name = f"Audit_Report_{contract_name}_{timestamp}.md"
+    file_path = reports_dir / file_name
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(report_content)
+
+    return file_path
+
+async def safe_llm_invoke(llm_with_tools, messages, retries=10, delay=26):
+    """Tự động chờ đúng thời gian nhả Quota của Google (26s) khi bị nghẽn 429."""
+    for attempt in range(retries):
+        try:
+            await asyncio.sleep(2.0)  # Nghỉ 2s giữa các step để hạ nhiệt RPM
+            return await llm_with_tools.ainvoke(messages)
+        except Exception as e:
+            err_msg = str(e)
+            if "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg:
+                console.print(f"[bold yellow]⚠️ Chạm ngưỡng Quota Gemini (20 RPM). Đang chờ {delay}s để Google reset quota (Lần {attempt+1}/{retries})...[/bold yellow]")
+                await asyncio.sleep(delay)
+            else:
+                raise e
+    return await llm_with_tools.ainvoke(messages)
+
 async def run_veriagent_audit(contract_path: str):
     """Chế độ Tự trị (Autonomous Batch Mode) với Multi-MCP Server."""
     api_key = os.getenv("GEMINI_API_KEY")
@@ -57,7 +88,6 @@ async def run_veriagent_audit(contract_path: str):
         border_style="green"
     ))
 
-    # Cấu hình 2 MCP Server (Slither và Foundry)
     slither_script = Path(__file__).parent.parent / "mcp_servers" / "slither_server.py"
     foundry_script = Path(__file__).parent.parent / "mcp_servers" / "foundry_server.py"
 
@@ -72,19 +102,16 @@ async def run_veriagent_audit(contract_path: str):
             await session_foundry.initialize()
             console.print("[bold green]✓ Kết nối thành công tới tất cả MCP Servers![/bold green]\n")
 
-            # Thu thập danh sách công cụ từ 2 Servers
             tools_s = await session_slither.list_tools()
             tools_f = await session_foundry.list_tools()
             all_mcp_tools = tools_s.tools + tools_f.tools
 
-            # Bản đồ điều hướng Tool Call về đúng Session
             tool_dispatch = {}
             for t in tools_s.tools:
                 tool_dispatch[t.name] = session_slither
             for t in tools_f.tools:
                 tool_dispatch[t.name] = session_foundry
 
-            # Map danh sách Tools sang định dạng Gemini
             tools_for_llm = [{
                 "type": "function",
                 "function": {
@@ -105,7 +132,12 @@ async def run_veriagent_audit(contract_path: str):
             step_count = 1
             while True:
                 console.print(f"[bold magenta]▶ [Bước {step_count}] Agent đang suy luận (Plan & Act)...[/bold magenta]")
-                response = await llm_with_tools.ainvoke(messages)
+
+                # Cắt tỉa ngữ cảnh để tiết kiệm token nếu chuỗi tin nhắn quá dài
+                if len(messages) > 11:
+                    messages = [messages[0]] + messages[-10:]
+
+                response = await safe_llm_invoke(llm_with_tools, messages)
                 messages.append(response)
 
                 if not response.tool_calls:
@@ -116,6 +148,8 @@ async def run_veriagent_audit(contract_path: str):
                         title="[bold green]BÁO CÁO KIỂM TOÁN TỔNG HỢP (VERIAGENT REPORT)[/bold green]",
                         border_style="cyan"
                     ))
+                    saved_path = save_markdown_report(contract_path, report_text)
+                    console.print(f"[bold green]💾 Báo cáo đã được lưu tự động tại:[/bold green] [yellow]{saved_path}[/yellow]")
                     break
 
                 for tool_call in response.tool_calls:
@@ -125,7 +159,6 @@ async def run_veriagent_audit(contract_path: str):
                     console.print(f"  [yellow]🛠️  Agent kích hoạt MCP Tool:[/yellow] [bold white]{tool_name}[/bold white]")
                     console.print(f"     Tham số: {tool_args}")
 
-                    # Điều hướng gọi tool tới đúng MCP Server
                     target_session = tool_dispatch.get(tool_name)
                     if not target_session:
                         observation = f"LỖI: Không tìm thấy Server hỗ trợ công cụ '{tool_name}'."
@@ -146,7 +179,7 @@ async def run_veriagent_audit(contract_path: str):
                 step_count += 1
 
 async def run_interactive_repl(contract_path: str):
-    """Chế độ Tương tác (Interactive REPL Mode) với Multi-MCP Server."""
+    """Chế độ Tương tác (Interactive REPL Mode) với Multi-MCP Server & Gemini 3.6-flash."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         console.print("[bold red]LỖI: Chưa cấu hình GEMINI_API_KEY![/bold red]")
@@ -159,6 +192,8 @@ async def run_interactive_repl(contract_path: str):
     foundry_params = StdioServerParameters(command=sys.executable, args=[str(foundry_script.resolve())], env=os.environ.copy())
 
     findings_memory = IncrementalFindingsMemory()
+    last_report_text = ""
+
     console.print("[dim]🔌 Đang kết nối đến Slither & Foundry MCP Servers...[/dim]")
 
     async with stdio_client(slither_params) as (read_s, write_s), stdio_client(foundry_params) as (read_f, write_f):
@@ -166,12 +201,10 @@ async def run_interactive_repl(contract_path: str):
             await session_slither.initialize()
             await session_foundry.initialize()
 
-            # Thu thập Tools từ 2 Servers
             tools_s = await session_slither.list_tools()
             tools_f = await session_foundry.list_tools()
             all_mcp_tools = tools_s.tools + tools_f.tools
 
-            # Tạo bản đồ điều hướng Session
             tool_dispatch = {}
             for t in tools_s.tools:
                 tool_dispatch[t.name] = session_slither
@@ -198,7 +231,10 @@ async def run_interactive_repl(contract_path: str):
             console.print(Panel.fit(
                 "[bold green]CHẾ ĐỘ TƯƠNG TÁC (VERIAGENT REPL INTERACTIVE)[/bold green]\n"
                 f"Target: [yellow]{contract_path}[/yellow]\n"
-                "Các lệnh đặc biệt: [bold cyan]/summary[/bold cyan] (xem bộ nhớ), [bold cyan]/exit[/bold cyan] (thoát session)",
+                "Các lệnh đặc biệt:\n"
+                "  [bold cyan]/summary[/bold cyan] : Xem danh sách phát hiện tích lũy\n"
+                "  [bold cyan]/report[/bold cyan]  : Xuất báo cáo Markdown (.md) ra thư mục reports/\n"
+                "  [bold cyan]/exit[/bold cyan]    : Thoát phiên làm việc",
                 border_style="cyan"
             ))
 
@@ -216,15 +252,35 @@ async def run_interactive_repl(contract_path: str):
                     console.print(Panel(findings_memory.get_summary(), title="[bold green]Incremental Findings Memory[/bold green]", border_style="yellow"))
                     continue
 
+                if user_input.lower() == "/report":
+                    content_to_save = last_report_text if last_report_text else findings_memory.get_summary()
+
+                    if not content_to_save or content_to_save == "Chưa ghi nhận lỗ hổng nào trong bộ nhớ.":
+                        console.print("[bold red]⚠️ Chưa có dữ liệu báo cáo để xuất! Hãy yêu cầu Agent phân tích hoặc kiểm toán trước.[/bold red]")
+                    else:
+                        saved_file = save_markdown_report(contract_path, content_to_save)
+                        console.print(Panel.fit(
+                            f"[bold green]✓ ĐÃ XUẤT BÁO CÁO THÀNH CÔNG![/bold green]\n"
+                            f"📁 Đường dẫn file: [yellow]{saved_file.resolve()}[/yellow]",
+                            border_style="green"
+                        ))
+                    continue
+
                 messages.append(HumanMessage(content=user_input))
 
                 while True:
-                    response = await llm_with_tools.ainvoke(messages)
+                    # Cắt tỉa ngữ cảnh: Giữ System Prompt + 10 tin nhắn gần nhất
+                    if len(messages) > 11:
+                        messages = [messages[0]] + messages[-10:]
+
+                    response = await safe_llm_invoke(llm_with_tools, messages)
                     messages.append(response)
 
                     if not response.tool_calls:
                         clean_text = extract_clean_text(response.content)
                         console.print(f"\n[bold green]VeriAgent ❯[/bold green]\n{clean_text}")
+
+                        last_report_text = clean_text
                         auto_record_findings(clean_text, findings_memory)
                         break
 

