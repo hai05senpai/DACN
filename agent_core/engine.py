@@ -36,7 +36,6 @@ def extract_clean_text(content) -> str:
 def auto_record_findings(text: str, memory: IncrementalFindingsMemory):
     """Tự động quét văn bản của Agent để phát hiện và ghi nhận lỗ hổng vào Memory."""
     if "REENTRANCY" in text.upper() or "SWC-107" in text:
-        # Kiểm tra xem đã ghi nhận lỗi Reentrancy chưa để tránh trùng lặp
         if not any("Reentrancy" in f["title"] for f in memory.findings):
             memory.add_finding(
                 title="Reentrancy Attack Vulnerability",
@@ -46,7 +45,7 @@ def auto_record_findings(text: str, memory: IncrementalFindingsMemory):
             )
 
 async def run_veriagent_audit(contract_path: str):
-    """Chế độ Tự trị (Autonomous Batch Mode)."""
+    """Chế độ Tự trị (Autonomous Batch Mode) với Multi-MCP Server."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         console.print("[bold red]LỖI: Chưa cấu hình GEMINI_API_KEY![/bold red]")
@@ -58,17 +57,34 @@ async def run_veriagent_audit(contract_path: str):
         border_style="green"
     ))
 
-    mcp_server_script = Path(__file__).parent.parent / "mcp_servers" / "slither_server.py"
-    server_params = StdioServerParameters(
-        command=sys.executable,
-        args=[str(mcp_server_script.resolve())],
-        env=os.environ.copy()
-    )
+    # Cấu hình 2 MCP Server (Slither và Foundry)
+    slither_script = Path(__file__).parent.parent / "mcp_servers" / "slither_server.py"
+    foundry_script = Path(__file__).parent.parent / "mcp_servers" / "foundry_server.py"
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            mcp_tools = await session.list_tools()
+    slither_params = StdioServerParameters(command=sys.executable, args=[str(slither_script.resolve())], env=os.environ.copy())
+    foundry_params = StdioServerParameters(command=sys.executable, args=[str(foundry_script.resolve())], env=os.environ.copy())
+
+    console.print("[dim]🔌 Đang kết nối đến Slither & Foundry MCP Servers...[/dim]")
+
+    async with stdio_client(slither_params) as (read_s, write_s), stdio_client(foundry_params) as (read_f, write_f):
+        async with ClientSession(read_s, write_s) as session_slither, ClientSession(read_f, write_f) as session_foundry:
+            await session_slither.initialize()
+            await session_foundry.initialize()
+            console.print("[bold green]✓ Kết nối thành công tới tất cả MCP Servers![/bold green]\n")
+
+            # Thu thập danh sách công cụ từ 2 Servers
+            tools_s = await session_slither.list_tools()
+            tools_f = await session_foundry.list_tools()
+            all_mcp_tools = tools_s.tools + tools_f.tools
+
+            # Bản đồ điều hướng Tool Call về đúng Session
+            tool_dispatch = {}
+            for t in tools_s.tools:
+                tool_dispatch[t.name] = session_slither
+            for t in tools_f.tools:
+                tool_dispatch[t.name] = session_foundry
+
+            # Map danh sách Tools sang định dạng Gemini
             tools_for_llm = [{
                 "type": "function",
                 "function": {
@@ -76,7 +92,7 @@ async def run_veriagent_audit(contract_path: str):
                     "description": t.description,
                     "parameters": t.input_schema
                 }
-            } for t in mcp_tools.tools]
+            } for t in all_mcp_tools]
 
             llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key)
             llm_with_tools = llm.bind_tools(tools_for_llm)
@@ -107,8 +123,15 @@ async def run_veriagent_audit(contract_path: str):
                     tool_args = tool_call["args"]
 
                     console.print(f"  [yellow]🛠️  Agent kích hoạt MCP Tool:[/yellow] [bold white]{tool_name}[/bold white]")
-                    tool_result = await session.call_tool(tool_name, tool_args)
-                    observation = tool_result.content[0].text
+                    console.print(f"     Tham số: {tool_args}")
+
+                    # Điều hướng gọi tool tới đúng MCP Server
+                    target_session = tool_dispatch.get(tool_name)
+                    if not target_session:
+                        observation = f"LỖI: Không tìm thấy Server hỗ trợ công cụ '{tool_name}'."
+                    else:
+                        tool_result = await target_session.call_tool(tool_name, tool_args)
+                        observation = tool_result.content[0].text
 
                     console.print(f"  [cyan]👁️  Observation (Kết quả nhận từ MCP Tool):[/cyan]")
                     preview_lines = observation.split("\n")[:4]
@@ -123,25 +146,38 @@ async def run_veriagent_audit(contract_path: str):
                 step_count += 1
 
 async def run_interactive_repl(contract_path: str):
-    """Chế độ Tương tác (Interactive REPL Mode)."""
+    """Chế độ Tương tác (Interactive REPL Mode) với Multi-MCP Server."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         console.print("[bold red]LỖI: Chưa cấu hình GEMINI_API_KEY![/bold red]")
         return
 
-    mcp_server_script = Path(__file__).parent.parent / "mcp_servers" / "slither_server.py"
-    server_params = StdioServerParameters(
-        command=sys.executable,
-        args=[str(mcp_server_script.resolve())],
-        env=os.environ.copy()
-    )
+    slither_script = Path(__file__).parent.parent / "mcp_servers" / "slither_server.py"
+    foundry_script = Path(__file__).parent.parent / "mcp_servers" / "foundry_server.py"
+
+    slither_params = StdioServerParameters(command=sys.executable, args=[str(slither_script.resolve())], env=os.environ.copy())
+    foundry_params = StdioServerParameters(command=sys.executable, args=[str(foundry_script.resolve())], env=os.environ.copy())
 
     findings_memory = IncrementalFindingsMemory()
+    console.print("[dim]🔌 Đang kết nối đến Slither & Foundry MCP Servers...[/dim]")
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            mcp_tools = await session.list_tools()
+    async with stdio_client(slither_params) as (read_s, write_s), stdio_client(foundry_params) as (read_f, write_f):
+        async with ClientSession(read_s, write_s) as session_slither, ClientSession(read_f, write_f) as session_foundry:
+            await session_slither.initialize()
+            await session_foundry.initialize()
+
+            # Thu thập Tools từ 2 Servers
+            tools_s = await session_slither.list_tools()
+            tools_f = await session_foundry.list_tools()
+            all_mcp_tools = tools_s.tools + tools_f.tools
+
+            # Tạo bản đồ điều hướng Session
+            tool_dispatch = {}
+            for t in tools_s.tools:
+                tool_dispatch[t.name] = session_slither
+            for t in tools_f.tools:
+                tool_dispatch[t.name] = session_foundry
+
             tools_for_llm = [{
                 "type": "function",
                 "function": {
@@ -149,7 +185,7 @@ async def run_interactive_repl(contract_path: str):
                     "description": t.description,
                     "parameters": t.input_schema
                 }
-            } for t in mcp_tools.tools]
+            } for t in all_mcp_tools]
 
             llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key)
             llm_with_tools = llm.bind_tools(tools_for_llm)
@@ -189,8 +225,6 @@ async def run_interactive_repl(contract_path: str):
                     if not response.tool_calls:
                         clean_text = extract_clean_text(response.content)
                         console.print(f"\n[bold green]VeriAgent ❯[/bold green]\n{clean_text}")
-                        
-                        # Tự động ghi nhận vào bộ nhớ nếu phát hiện lỗi
                         auto_record_findings(clean_text, findings_memory)
                         break
 
@@ -199,7 +233,20 @@ async def run_interactive_repl(contract_path: str):
                         tool_args = tool_call["args"]
 
                         console.print(f"  [yellow]🛠️  Kích hoạt MCP Tool:[/yellow] {tool_name} {tool_args}")
-                        tool_result = await session.call_tool(tool_name, tool_args)
-                        observation = tool_result.content[0].text
+
+                        target_session = tool_dispatch.get(tool_name)
+                        if not target_session:
+                            observation = f"LỖI: Không tìm thấy Server hỗ trợ công cụ '{tool_name}'."
+                        else:
+                            tool_result = await target_session.call_tool(tool_name, tool_args)
+                            observation = tool_result.content[0].text
+
+                        console.print(f"  [cyan]👁️  Observation (Kết quả nhận từ MCP Tool):[/cyan]")
+                        preview_lines = observation.split("\n")[:4]
+                        for line in preview_lines:
+                            console.print(f"     [dim]{line}[/dim]")
+                        if len(observation.split("\n")) > 4:
+                            console.print("     [dim]... (đã nén bớt log dài)[/dim]")
+                        console.print()
 
                         messages.append(ToolMessage(content=observation, tool_call_id=tool_call["id"]))
